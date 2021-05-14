@@ -34,10 +34,14 @@ float rotX, rotY, rotZ;
 float tempInC;
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   Wire1.begin();
+  // Run at i2c @ 100KHz to avoid race condition in setting stop bit for last data bit rxed.
+  // At 100KHz the i2c must be serviced from the main loop within 100uS
+  Wire1.setClock(100000);
   setupMPU();
+  delay(1000);
 }
 
 
@@ -66,19 +70,40 @@ void setupMPU(){
 
 uint8_t bytesRead;
 bool readSuccess;
+uint8_t byteWriteError;
 void recordAccelRegisters() {
   Wire1.beginTransmission(0b1101000); //I2C address of the MPU
   Wire1.write(0x3B); //Starting register for Accel Readings
-  Wire1.endTransmission();
+  //Wire1.endTransmission();
+  //Serial.println("Starting et");
+  Wire1.endTransmission_nb(true, &byteWriteError);
+  while (true) {  
+    //digitalWrite(LED_BUILTIN, HIGH);
+    if (Wire1.endTransmission_nb(false, &byteWriteError))
+      break;
+    //digitalWrite(LED_BUILTIN, LOW);
+  }
+  //digitalWrite(LED_BUILTIN, LOW);
+  if (byteWriteError != 0) {
+    Serial.print("byteWriteError: "); Serial.println(byteWriteError);
+  }
+ 
   //Wire1.requestFrom(0b1101000,6); //Request Accel Registers (3B - 40)
+  // Total 650uS for requestFrom @ 100KHz. 2.3uS per pass
+  // Total 170uS for requestFrom @ 400KHz. 2.3uS per pass
+  // Polling for RX bytes, so run at i2c @ 100KHz to allow 100uS to service RX bytes.
   Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) 0b1101000 , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
   while (true) {
-    digitalWrite(LED_BUILTIN, HIGH);
+    PIOB->PIO_SODR = PIO_SODR_P26;
+    //digitalWrite(LED_BUILTIN, HIGH);
+    //delay(1);
     if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) 0b1101000 , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true))
       break;
-    digitalWrite(LED_BUILTIN, LOW);
+    //digitalWrite(LED_BUILTIN, LOW);
+    PIOB->PIO_CODR = PIO_CODR_P26;
   }
-  digitalWrite(LED_BUILTIN, LOW);
+  PIOB->PIO_CODR = PIO_CODR_P26;
+  //digitalWrite(LED_BUILTIN, LOW);
   if (readSuccess) {
     while(Wire1.available() < 6);
     accelX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
@@ -86,6 +111,8 @@ void recordAccelRegisters() {
     accelZ = Wire1.read()<<8|Wire1.read(); //Store last two bytes into accelZ
     processAccelData();
   }
+  else
+    Serial.println("accell read failed");
 }
 
 void recordTempRegisters() {

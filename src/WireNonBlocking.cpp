@@ -168,12 +168,13 @@ uint8_t TwoWire::requestFrom(uint8_t address, uint8_t quantity, uint32_t iaddres
 	return readed;
 }
 
-// state machine version of requestFrom. Non-blocking, 4.3uS execution on atsam3x at 84MHz
+// state machine version of requestFrom. Non-blocking, 2.3uS execution on atsam3x at 84MHz
 // You must call this function in a sequence.
 // On the first call resetStMach must be asserted.
 // Then the function must be called repetitively until it returns false. 
 // ie, processing is complete.
 // All other parameters must be set correctly for every call.
+// Polling for RX bytes, so run at i2c @ 100KHz to allow 100uS to service RX bytes.
 enum rqStates {RQ_IDLE, RQ_START, RQ_WAIT_BYTE, RQ_WAIT_TRANSFER_COMPLETE};
 int rqCurrState = RQ_IDLE;
 int rqReaded = 0;
@@ -202,27 +203,46 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
       status_reg = TWI_GetStatus(twi);
       if ((status_reg & TWI_SR_RXRDY) == TWI_SR_RXRDY && (status_reg & TWI_SR_NACK) != TWI_SR_NACK) {
         rxBuffer[rqReaded++] = TWI_ReadByte(twi);
+	// Could there be a race condition here?
+	// If this function is not called within one i2c byte period (25uS @ 400KHz or 100uS @ 100KHz)
+	// then the stop condition may not be set correctly
+	// This might be a good reason to keep the i2c bus at 100KHz
+	// Not sure that this is true. The next byte may not be sent until TWI_ReadByte is executed?
         if (rqReaded + 1 == quantity)
           TWI_SendSTOPCondition(twi);
         if (rqReaded >= quantity)
           rqCurrState = RQ_WAIT_TRANSFER_COMPLETE;
+	rqStartMillis = millis();
       }
       // timeout is 1mS per byte. Way too much time, but it should work
-      else if ((millis() - rqStartMillis) > quantity) {
+      else if ((millis() - rqStartMillis) > quantity + 2) {
         rqCurrState = RQ_IDLE;
 	rqDone = true;
       }
       break;
     case RQ_WAIT_TRANSFER_COMPLETE:
-      TWI_WaitTransferComplete(twi, RECV_TIMEOUT);
-      // set rx buffer iterator vars
-      rxBufferIndex = 0;
-      rxBufferLength = rqReaded;
-      rqDone = true;
-      *success = true;
-      *bytesRead = rqReaded;
-      rqCurrState = RQ_IDLE;
-      break;
+      status_reg = TWI_GetStatus(twi);
+      if ((status_reg & TWI_SR_TXCOMP) == TWI_SR_TXCOMP) {
+        if (status_reg & TWI_SR_NACK) {
+          *success = false; // error, finishing up
+          rqDone = true;
+          rqCurrState = RQ_IDLE;
+        }
+        else {
+         rxBufferIndex = 0;
+         rxBufferLength = rqReaded;
+         rqDone = true;
+         *success = true;
+         *bytesRead = rqReaded;
+         rqCurrState = RQ_IDLE;
+       }
+      }
+      else if (rqStartMillis - millis() >= 2) {
+        rqCurrState = RQ_IDLE;
+        *success = false; // error, finishing up
+        rqDone = true;
+      }
+      break; 
     default:
       break;
   }
@@ -296,6 +316,119 @@ uint8_t TwoWire::endTransmission(uint8_t sendStop) {
 	txBufferLength = 0;		// empty buffer
 	status = MASTER_IDLE;
 	return error;
+}
+
+
+// state machine version of endTransmission. Non-blocking, 2.3uS execution on atsam3x at 84MHz
+// You must call this function in a sequence.
+// On the first call resetStMach must be asserted.
+// Then the function must be called repetitively until it returns false. 
+// ie, processing is complete.
+// Polling, so run at i2c @ 100KHz to allow 100uS to service .
+enum etStates {ET_IDLE, ET_START, ET_WAIT_ADDR_SENT, ET_SEND_DATA, ET_WAIT_DATA_SENT, ET_WAIT_STOP_SENT};
+int etCurrSt = ET_IDLE;
+bool etDone;
+unsigned long etStartMillis;
+uint16_t etDataSent;
+bool TwoWire::endTransmission_nb(bool resetStMach, uint8_t *trError) {
+  etDone = false;
+  uint32_t status_reg = 0;
+    
+  if (resetStMach)
+    etCurrSt = ET_START;
+  switch (etCurrSt) {
+    case ET_IDLE:
+     // Do nothing. Wait here for start request
+     break;
+    case ET_START:
+      // transmit buffer (non-blocking)
+      TWI_StartWrite(twi, txAddress, 0, 0, txBuffer[0]);
+      etCurrSt = ET_WAIT_ADDR_SENT;
+      etStartMillis = millis();
+      *trError = 0;
+      break;
+    case ET_WAIT_ADDR_SENT:
+      status_reg = TWI_GetStatus(twi);
+      if ((status_reg & TWI_SR_TXRDY) == TWI_SR_TXRDY) {
+        if (status_reg & TWI_SR_NACK) {
+          *trError = 2; // error, got NACK or timeout on address transmit
+          etCurrSt = ET_IDLE;
+          etDone = true;
+        }
+        else {
+          if (txBufferLength == 1) {
+            TWI_Stop(twi);
+            etCurrSt = ET_WAIT_STOP_SENT;
+          }
+	  else {
+            etDataSent = 1;
+            TWI_WriteByte(twi, txBuffer[etDataSent++]);
+            etCurrSt = ET_WAIT_DATA_SENT;
+	  }
+          etStartMillis = millis();
+        }
+      }
+      else if (etStartMillis - millis() >= 2) {
+        etCurrSt = ET_IDLE;
+        *trError = 2; // error, got NACK or timeout on address transmit
+        etDone = true;
+      }
+      break;
+    case ET_SEND_DATA:
+      TWI_WriteByte(twi, txBuffer[etDataSent++]);
+      etCurrSt = ET_WAIT_DATA_SENT;
+      etStartMillis = millis();
+      break;
+    case ET_WAIT_DATA_SENT:
+      status_reg = TWI_GetStatus(twi);
+      if ((status_reg & TWI_SR_TXRDY) == TWI_SR_TXRDY) {
+        if (status_reg & TWI_SR_NACK) {
+          *trError = 3; // error, got NACK or timeout on data transmit
+          etCurrSt = ET_IDLE;
+          etDone = true;
+        }
+        else {
+          etStartMillis = millis();
+          if (etDataSent == txBufferLength) {
+            etCurrSt = ET_WAIT_STOP_SENT;
+            TWI_Stop(twi);
+          }
+          else
+            etCurrSt = ET_SEND_DATA;
+        }
+      }
+      else if (etStartMillis - millis() >= 2) {
+        etCurrSt = ET_IDLE;
+        *trError = 3; // error, got NACK or timeout on address transmit
+        etDone = true;
+      }
+      break;
+    case ET_WAIT_STOP_SENT:
+      status_reg = TWI_GetStatus(twi);
+      if ((status_reg & TWI_SR_TXCOMP) == TWI_SR_TXCOMP) {
+        if (status_reg & TWI_SR_NACK) {
+          *trError = 4; // error, finishing up
+          etDone = true;
+          etCurrSt = ET_IDLE;
+        }
+        else {
+         etDone = true;
+	 etCurrSt = ET_IDLE;
+       }
+      }
+      else if (etStartMillis - millis() >= 2) {
+        etCurrSt = ET_IDLE;
+        *trError = 4; // error, finishing up
+        etDone = true;
+      }
+    default:
+      break;
+  }
+  if (etDone) {
+    txBufferLength = 0; // empty buffer
+    status = MASTER_IDLE;
+  }
+  return etDone;
 }
 
 //	This provides backwards compatibility with the original

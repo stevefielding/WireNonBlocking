@@ -44,6 +44,7 @@ public:
 	void beginTransmission(int);
 	uint8_t endTransmission(void);
     uint8_t endTransmission(uint8_t);
+        bool endTransmission_nb(bool resetStMach, uint8_t *trError);
 	uint8_t requestFrom(uint8_t, uint8_t);
     uint8_t requestFrom(uint8_t, uint8_t, uint8_t);
 	uint8_t requestFrom(uint8_t, uint8_t, uint32_t, uint8_t, uint8_t);
