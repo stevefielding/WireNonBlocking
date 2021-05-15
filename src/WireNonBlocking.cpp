@@ -207,11 +207,6 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
         rxBuffer[rqReaded++] = TWI_ReadByte(twi);
 	if (status_reg & TWI_SR_OVRE) 
           overRunDetected = true;
-	// Could there be a race condition here?
-	// If this function is not called within one i2c byte period (25uS @ 400KHz or 100uS @ 100KHz)
-	// then the stop condition may not be set correctly
-	// This might be a good reason to keep the i2c bus at 100KHz
-	// Not sure that this is true. The next byte may not be sent until TWI_ReadByte is executed?
         if (rqReaded + 1 == quantity)
           TWI_SendSTOPCondition(twi);
         if (rqReaded >= quantity)
