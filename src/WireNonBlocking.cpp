@@ -179,6 +179,7 @@ enum rqStates {RQ_IDLE, RQ_START, RQ_WAIT_BYTE, RQ_WAIT_TRANSFER_COMPLETE};
 int rqCurrState = RQ_IDLE;
 int rqReaded = 0;
 unsigned long rqStartMillis;
+bool overRunDetected;
 bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRead, uint8_t address, uint8_t quantity, uint32_t iaddress, uint8_t isize, uint8_t sendStop) {
   bool rqDone = false;
   *bytesRead = 0;
@@ -194,6 +195,7 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
       // do nothing. Wait for start request
       break;
     case RQ_START:
+      overRunDetected = false;
       rqReaded = 0;
       TWI_StartRead(twi, address, iaddress, isize);
       rqCurrState = RQ_WAIT_BYTE;
@@ -203,6 +205,8 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
       status_reg = TWI_GetStatus(twi);
       if ((status_reg & TWI_SR_RXRDY) == TWI_SR_RXRDY && (status_reg & TWI_SR_NACK) != TWI_SR_NACK) {
         rxBuffer[rqReaded++] = TWI_ReadByte(twi);
+	if (status_reg & TWI_SR_OVRE) 
+          overRunDetected = true;
 	// Could there be a race condition here?
 	// If this function is not called within one i2c byte period (25uS @ 400KHz or 100uS @ 100KHz)
 	// then the stop condition may not be set correctly
@@ -223,7 +227,8 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
     case RQ_WAIT_TRANSFER_COMPLETE:
       status_reg = TWI_GetStatus(twi);
       if ((status_reg & TWI_SR_TXCOMP) == TWI_SR_TXCOMP) {
-        if (status_reg & TWI_SR_NACK) {
+	// check for nack or over-run. over-run should have been cancelled by the status reg read
+        if (status_reg & TWI_SR_NACK || status_reg & TWI_SR_OVRE || overRunDetected ) {
           *success = false; // error, finishing up
           rqDone = true;
           rqCurrState = RQ_IDLE;

@@ -50,7 +50,10 @@ void setup() {
   Wire1.begin();
   // Run i2c @ 100KHz.
   // At 100KHz the i2c must be serviced from the main loop within 100uS
-  Wire1.setClock(100000);
+  // Added over-run detection to requestFrom_nb, and now running at 400KHz 
+  // should work with the exception of occasional missed updates when
+  // the main loop delays extend beyond 25uS
+  Wire1.setClock(400000);
   setupMPU();
   delay(1000);
   icmCurrSt = ICM_START;
@@ -94,6 +97,10 @@ unsigned long loopStartMillis;
 #ifdef TEST_EFFECT_OF_LOOP_DELAYS
 unsigned int debugCnt=0;
 #endif
+//#define TEST_EFFECT_OF_LOOP_DELAYS2
+#ifdef TEST_EFFECT_OF_LOOP_DELAYS2
+unsigned int debugCnt2=0;
+#endif
 // ------------------------- readICMRegisters ---------------------------
 // State machine reads accell, gyro and temp registers.
 void readICMRegisters() {
@@ -114,7 +121,12 @@ uint8_t bytesRead;
       break;
     case ICM_ACCEL1:
       // Wait for accell register set complete, and then start accell data access
-      if (Wire1.endTransmission_nb(false, &byteWriteError)) {
+ #ifdef TEST_EFFECT_OF_LOOP_DELAYS2
+      // This delay does not seem to have any adverse effect
+      debugCnt2++;
+      if (debugCnt2 % 100 == 0) delay(10); 
+#endif
+     if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_ACCEL2;
         // Total 650uS for requestFrom @ 100KHz. 2.3uS per pass
         // Total 170uS for requestFrom @ 400KHz. 2.3uS per pass
@@ -126,11 +138,13 @@ uint8_t bytesRead;
       // Wait for accell data access complete, and then read accell data and convert to float
 #ifdef TEST_EFFECT_OF_LOOP_DELAYS
       // insert 10mS delay every 1000 passes, and see if i2c reads can recover
-      // To answer the question above. Yes, recovery does happen, but 0 values are inserted into the accel readings. Not sure why.
-      // Ideally, the accel values would be unchanged from the previous reading.
-      // I would have thought that requestFrom_nb would timeout and return readSuccess false, and then the accel values would not 
-      // be updated. Obviously this is not the case.
-      // Anyway, the good news is that occasional large delays in the main loop will not kill the i2c register reads.
+      // To answer the question above. Yes, recovery does happen, but 0 values are inserted into the accel readings.
+      // This is my theory of what is happening. The icm-20602 chip will continue to provide read data beyond the 6 bytes specified
+      // and so if we miss reading a byte, then we simply end up reading bytes beyond 0x3b, and these bytes happen to have a value of 0x00
+      // Thus the read timeout is not triggered and readSuccess is always returned as true, and we end up updating the accel values.
+      // It turns out that this theory is correct. Problem fixed. Added over-run detection to requestFrom_nb, which now readSuccess returns false
+      // when over-run is detected, and we detect this in the code below, and do not update the accel values.
+      // Thus the effect of occasional large delays in the main loop should only result in the occasional skipped register read.
       debugCnt++;
       if (debugCnt % 1000 == 0) delay(10); 
 #endif
