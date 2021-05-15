@@ -1,3 +1,9 @@
+/* Original work by EEnthusiast.
+Heavily modified to work with WireNonBlocking library.
+Tested with ICM-20602 and ATSAM3X (Arduino Due) I2C1
+ */
+
+
 /*
 ===Contact & Support===
 Website: http://eeenthusiast.com/
@@ -22,16 +28,17 @@ the software.
 //#include <Wire.h>
 #include <WireNonBlocking.h>
 
+// ICM20602 temp variables and float conversion results
 int16_t accelX, accelY, accelZ;
 float gForceX=0, gForceY=0, gForceZ=0;
-
 int16_t gyroX, gyroY, gyroZ;
 float rotX=0, rotY=0, rotZ=0;
-
 float tempInC;
 
-#define ICM_ADDR 0b1101000
 
+#define ICM20602_ADDR 0b1101000
+
+// State machine states and variables
 enum icmStates {ICM_START, ICM_ACCEL1, ICM_ACCEL2,ICM_GYRO1, ICM_GYRO2, 
                 ICM_TEMP1, ICM_TEMP2, ICM_INTER_TRANS_DELAY1, ICM_INTER_TRANS_DELAY2};
 int icmCurrSt;
@@ -55,11 +62,11 @@ void setup() {
 //    18uS when doing temperature conversion to float
 //    44uS when doing accell or gyro conversion to float
 void loop() {
-  PIOB->PIO_SODR = PIO_SODR_P26;
+  PIOB->PIO_SODR = PIO_SODR_P26; // led high. Timing check
   readICMRegisters();
-  PIOB->PIO_CODR = PIO_CODR_P26;
-  //recordGyroRegisters();
-  //recordTempRegisters();
+  PIOB->PIO_CODR = PIO_CODR_P26; // led low
+  // if all the registers have been read and saved to floats, then print the 
+  // results and wait 100mS before next read.
   if (icmPassDone) {
     printData();
     delay(100);
@@ -67,15 +74,15 @@ void loop() {
 }
 
 void setupMPU(){
-  Wire1.beginTransmission(0b1101000); //This is the I2C address of the MPU (b1101000/b1101001 for AC0 low/high datasheet sec. 9.2)
+  Wire1.beginTransmission(ICM20602_ADDR); //This is the I2C address of the MPU (b1101000/b1101001 for AC0 low/high datasheet sec. 9.2)
   Wire1.write(0x6B); //Accessing the register 6B - Power Management (Sec. 4.28)
   Wire1.write(0b00000000); //Setting SLEEP register to 0. (Required; see Note on p. 9)
   Wire1.endTransmission();  
-  Wire1.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire1.beginTransmission(ICM20602_ADDR); //I2C address of the MPU
   Wire1.write(0x1B); //Accessing the register 1B - Gyroscope Configuration (Sec. 4.4) 
   Wire1.write(0x00000000); //Setting the gyro to full scale +/- 250deg./s 
   Wire1.endTransmission(); 
-  Wire1.beginTransmission(0b1101000); //I2C address of the MPU
+  Wire1.beginTransmission(ICM20602_ADDR); //I2C address of the MPU
   Wire1.write(0x1C); //Accessing the register 1C - Acccelerometer Configuration (Sec. 4.5) 
   Wire1.write(0b00000000); //Setting the accel to +/- 2g
   Wire1.endTransmission(); 
@@ -83,7 +90,10 @@ void setupMPU(){
 
 uint8_t byteWriteError;
 unsigned long loopStartMillis;
-
+//#define TEST_EFFECT_OF_LOOP_DELAYS
+#ifdef TEST_EFFECT_OF_LOOP_DELAYS
+unsigned int debugCnt=0;
+#endif
 // ------------------------- readICMRegisters ---------------------------
 // State machine reads accell, gyro and temp registers.
 void readICMRegisters() {
@@ -98,7 +108,7 @@ uint8_t bytesRead;
       byteWriteError = 0;
       readSuccess = false;
       icmCurrSt = ICM_ACCEL1;
-      Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
+      Wire1.beginTransmission(ICM20602_ADDR); //I2C address of the MPU
       Wire1.write(0x3B); //Starting register for Accel Readings
       Wire1.endTransmission_nb(true, &byteWriteError);
       break;
@@ -109,12 +119,22 @@ uint8_t bytesRead;
         // Total 650uS for requestFrom @ 100KHz. 2.3uS per pass
         // Total 170uS for requestFrom @ 400KHz. 2.3uS per pass
         // Polling for RX bytes, so run at i2c @ 100KHz to allow 100uS to service RX bytes.
-        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
+        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
       }
       break;
     case ICM_ACCEL2:
       // Wait for accell data access complete, and then read accell data and convert to float
-      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
+#ifdef TEST_EFFECT_OF_LOOP_DELAYS
+      // insert 10mS delay every 1000 passes, and see if i2c reads can recover
+      // To answer the question above. Yes, recovery does happen, but 0 values are inserted into the accel readings. Not sure why.
+      // Ideally, the accel values would be unchanged from the previous reading.
+      // I would have thought that requestFrom_nb would timeout and return readSuccess false, and then the accel values would not 
+      // be updated. Obviously this is not the case.
+      // Anyway, the good news is that occasional large delays in the main loop will not kill the i2c register reads.
+      debugCnt++;
+      if (debugCnt % 1000 == 0) delay(10); 
+#endif
+      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
         if (readSuccess && bytesRead >= 6) {
           accelX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
           accelY = Wire1.read()<<8|Wire1.read(); //Store middle two bytes into accelY
@@ -122,40 +142,36 @@ uint8_t bytesRead;
           gForceX = accelX / 16384.0;
           gForceY = accelY / 16384.0;
           gForceZ = accelZ / 16384.0;
-          //processAccelData();
         }
         else {
           Serial.println("accell read failed");
           Serial.println(readSuccess);
           Serial.println(bytesRead);
         } 
-        //printData();
         icmCurrSt = ICM_INTER_TRANS_DELAY1;
         loopStartMillis = millis();
       }
       break;
-
     case ICM_INTER_TRANS_DELAY1:
       // Wait 1mS before then start gyro address register set.
       // Without this delay, the i2c read fails.
       if (millis() - loopStartMillis >= 1) {
         icmCurrSt = ICM_GYRO1;
-        Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
+        Wire1.beginTransmission(ICM20602_ADDR); //I2C address of the MPU
         Wire1.write(0x43); //Starting register for Gyro Readings
         Wire1.endTransmission_nb(true, &byteWriteError); 
       }
       break;
-
     case ICM_GYRO1:
       // Wait for gyro address register set done, and then start data access
       if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_GYRO2;
-        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
+        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
       }
       break;
     case ICM_GYRO2:
       // Wait for gyro data access complete, and then read the data and convert to float.
-      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
+      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
         if (readSuccess && bytesRead >= 6) {
           gyroX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
           gyroY = Wire1.read()<<8|Wire1.read(); //Store middle two bytes into accelY
@@ -163,7 +179,6 @@ uint8_t bytesRead;
           rotX = gyroX / 131.0;
           rotY = gyroY / 131.0; 
           rotZ = gyroZ / 131.0; 
-          //processGyroData();
         }
         else {
           Serial.println("gyro read failed");
@@ -174,27 +189,25 @@ uint8_t bytesRead;
         loopStartMillis = millis();
       }
       break;
-
     case ICM_INTER_TRANS_DELAY2:
       // Wait 1mS, and then start Temp register access
       if (millis() - loopStartMillis >= 1) {
         icmCurrSt = ICM_TEMP1;
-        Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
+        Wire1.beginTransmission(ICM20602_ADDR); //I2C address of the MPU
         Wire1.write(0x41); //Starting register for Temp Readings
         Wire1.endTransmission_nb(true, &byteWriteError);
       }
       break;
-
     case ICM_TEMP1:
       // Wait for Temp address register set done, and then start Temp data access
       if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_TEMP2;
-        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR , (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
+        Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR , (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
       }
       break;
      case ICM_TEMP2:
       // Wait for Temp data access complete, and then convert to float and set the done flag
-      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
+      if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM20602_ADDR, (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
         icmCurrSt = ICM_START;
         if (readSuccess && bytesRead >= 2) {
           regVal = Wire1.read()<<8|Wire1.read(); //Store first two bytes into temp
@@ -205,8 +218,6 @@ uint8_t bytesRead;
         icmPassDone = true;
       }
       break;
-
-
     default:
       break;
   }
