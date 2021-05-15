@@ -23,38 +23,47 @@ the software.
 #include <WireNonBlocking.h>
 
 int16_t accelX, accelY, accelZ;
-float gForceX, gForceY, gForceZ;
+float gForceX=0, gForceY=0, gForceZ=0;
 
 int16_t gyroX, gyroY, gyroZ;
-float rotX, rotY, rotZ;
+float rotX=0, rotY=0, rotZ=0;
 
 float tempInC;
 
 #define ICM_ADDR 0b1101000
 
-enum icmStates {ICM_INIT1, ICM_INIT2,ICM_INIT3, ICM_INIT4, ICM_ACCEL1, ICM_ACCEL2, ICM_GYRO1, ICM_GYRO2, ICM_TEMP1, ICM_TEMP2};
+enum icmStates {ICM_START, ICM_ACCEL1, ICM_ACCEL2,ICM_GYRO1, ICM_GYRO2, 
+                ICM_TEMP1, ICM_TEMP2, ICM_INTER_TRANS_DELAY1, ICM_INTER_TRANS_DELAY2};
 int icmCurrSt;
-
+bool icmPassDone;
 
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   Wire1.begin();
-  // Run at i2c @ 100KHz to avoid race condition in setting stop bit for last data bit rxed.
+  // Run i2c @ 100KHz.
   // At 100KHz the i2c must be serviced from the main loop within 100uS
   Wire1.setClock(100000);
   setupMPU();
   delay(1000);
-  icmCurrSt = ICM_INIT4;
+  icmCurrSt = ICM_START;
 }
 
-
+// 2.5mS per icmPassDone
+// Execution time per pass:
+//    Normally around 3uS 
+//    18uS when doing temperature conversion to float
+//    44uS when doing accell or gyro conversion to float
 void loop() {
-  recordAccelRegisters();
+  PIOB->PIO_SODR = PIO_SODR_P26;
+  readICMRegisters();
+  PIOB->PIO_CODR = PIO_CODR_P26;
   //recordGyroRegisters();
   //recordTempRegisters();
-  //printData();
-  //delay(100);
+  if (icmPassDone) {
+    printData();
+    delay(100);
+  }
 }
 
 void setupMPU(){
@@ -72,19 +81,20 @@ void setupMPU(){
   Wire1.endTransmission(); 
 }
 
-uint8_t bytesRead;
-bool readSuccess;
 uint8_t byteWriteError;
-void recordAccelRegisters() {
+unsigned long loopStartMillis;
 
-
-uint8_t byteWriteError;
+// ------------------------- readICMRegisters ---------------------------
+// State machine reads accell, gyro and temp registers.
+void readICMRegisters() {
 int16_t regVal;
 bool readSuccess;
 uint8_t bytesRead;
 
   switch (icmCurrSt) {
-    case ICM_INIT4:
+    case ICM_START:
+      // Start accell register set
+      icmPassDone = false;
       byteWriteError = 0;
       readSuccess = false;
       icmCurrSt = ICM_ACCEL1;
@@ -93,6 +103,7 @@ uint8_t bytesRead;
       Wire1.endTransmission_nb(true, &byteWriteError);
       break;
     case ICM_ACCEL1:
+      // Wait for accell register set complete, and then start accell data access
       if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_ACCEL2;
         // Total 650uS for requestFrom @ 100KHz. 2.3uS per pass
@@ -102,14 +113,16 @@ uint8_t bytesRead;
       }
       break;
     case ICM_ACCEL2:
+      // Wait for accell data access complete, and then read accell data and convert to float
       if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
-        icmCurrSt = ICM_GYRO1;
         if (readSuccess && bytesRead >= 6) {
-          //while(Wire1.available() < 6);
           accelX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
           accelY = Wire1.read()<<8|Wire1.read(); //Store middle two bytes into accelY
           accelZ = Wire1.read()<<8|Wire1.read(); //Store last two bytes into accelZ
-          processAccelData();
+          gForceX = accelX / 16384.0;
+          gForceY = accelY / 16384.0;
+          gForceZ = accelZ / 16384.0;
+          //processAccelData();
         }
         else {
           Serial.println("accell read failed");
@@ -117,118 +130,86 @@ uint8_t bytesRead;
           Serial.println(bytesRead);
         } 
         //printData();
-        delay(1);
+        icmCurrSt = ICM_INTER_TRANS_DELAY1;
+        loopStartMillis = millis();
+      }
+      break;
+
+    case ICM_INTER_TRANS_DELAY1:
+      // Wait 1mS before then start gyro address register set.
+      // Without this delay, the i2c read fails.
+      if (millis() - loopStartMillis >= 1) {
+        icmCurrSt = ICM_GYRO1;
         Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
         Wire1.write(0x43); //Starting register for Gyro Readings
         Wire1.endTransmission_nb(true, &byteWriteError); 
       }
       break;
 
-
-
-
     case ICM_GYRO1:
+      // Wait for gyro address register set done, and then start data access
       if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_GYRO2;
         Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR , (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
       }
       break;
     case ICM_GYRO2:
+      // Wait for gyro data access complete, and then read the data and convert to float.
       if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 6, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
-        icmCurrSt = ICM_TEMP1;
         if (readSuccess && bytesRead >= 6) {
           gyroX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
           gyroY = Wire1.read()<<8|Wire1.read(); //Store middle two bytes into accelY
           gyroZ = Wire1.read()<<8|Wire1.read(); //Store last two bytes into accelZ
-          processGyroData();
+          rotX = gyroX / 131.0;
+          rotY = gyroY / 131.0; 
+          rotZ = gyroZ / 131.0; 
+          //processGyroData();
         }
         else {
           Serial.println("gyro read failed");
           Serial.println(readSuccess);
           Serial.println(bytesRead);
         }
-        delay(1);
+        icmCurrSt = ICM_INTER_TRANS_DELAY2;
+        loopStartMillis = millis();
+      }
+      break;
+
+    case ICM_INTER_TRANS_DELAY2:
+      // Wait 1mS, and then start Temp register access
+      if (millis() - loopStartMillis >= 1) {
+        icmCurrSt = ICM_TEMP1;
         Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
         Wire1.write(0x41); //Starting register for Temp Readings
         Wire1.endTransmission_nb(true, &byteWriteError);
       }
       break;
+
     case ICM_TEMP1:
+      // Wait for Temp address register set done, and then start Temp data access
       if (Wire1.endTransmission_nb(false, &byteWriteError)) {
         icmCurrSt = ICM_TEMP2;
         Wire1.requestFrom_nb(true, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR , (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true);
       }
       break;
      case ICM_TEMP2:
+      // Wait for Temp data access complete, and then convert to float and set the done flag
       if (Wire1.requestFrom_nb(false, &readSuccess, &bytesRead, (uint8_t) ICM_ADDR, (uint8_t) 2, (uint32_t) 0, (uint8_t) 0, (uint8_t) true)) {
-        icmCurrSt = ICM_INIT4;
+        icmCurrSt = ICM_START;
         if (readSuccess && bytesRead >= 2) {
           regVal = Wire1.read()<<8|Wire1.read(); //Store first two bytes into temp
-          tempInC = processTempData(regVal);
-          printData();
+          tempInC = ((regVal / 326.8) + 25.0);
         }
         else
           Serial.println("temp read failed");
-        printData();
-        delay(100); 
-        //Wire1.beginTransmission(ICM_ADDR); //I2C address of the MPU
-        //Wire1.write(0x3B); //Starting register for Accel Readings
-        //Wire1.endTransmission_nb(true, &byteWriteError);
+        icmPassDone = true;
       }
       break;
-
-
-
-
 
 
     default:
       break;
   }
-
-
-
-
-
-}
-
-void recordTempRegisters() {
-  Wire1.beginTransmission(0b1101000); //I2C address of the MPU
-  Wire1.write(0x41); //Starting register for Temp Readings
-  Wire1.endTransmission();
-  Wire1.requestFrom(0b1101000,2); //Request Accel Registers (3B - 40)
-  while(Wire1.available() < 2);
-  int16_t regVal = Wire1.read()<<8|Wire1.read(); //Store first two bytes into temp
-
-  tempInC = processTempData(regVal);
-}
-
-void processAccelData(){
-  gForceX = accelX / 16384.0;
-  gForceY = accelY / 16384.0;
-  gForceZ = accelZ / 16384.0;
-}
-
-void recordGyroRegisters() {
-  Wire1.beginTransmission(0b1101000); //I2C address of the MPU
-  Wire1.write(0x43); //Starting register for Gyro Readings
-  Wire1.endTransmission();
-  Wire1.requestFrom(0b1101000,6); //Request Gyro Registers (43 - 48)
-  while(Wire1.available() < 6);
-  gyroX = Wire1.read()<<8|Wire1.read(); //Store first two bytes into accelX
-  gyroY = Wire1.read()<<8|Wire1.read(); //Store middle two bytes into accelY
-  gyroZ = Wire1.read()<<8|Wire1.read(); //Store last two bytes into accelZ
-  processGyroData();
-}
-
-void processGyroData() {
-  rotX = gyroX / 131.0;
-  rotY = gyroY / 131.0; 
-  rotZ = gyroZ / 131.0;
-}
-
-float processTempData(int16_t regVal) {
-  return ((regVal / 326.8) + 25.0);
 }
 
 void printData() {
