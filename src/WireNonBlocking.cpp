@@ -214,7 +214,7 @@ bool TwoWire::requestFrom_nb(bool resetStMach, bool *success,  uint8_t *bytesRea
 	rqStartMillis = millis();
       }
       // timeout is 1mS per byte. Way too much time, but it should work
-      else if ((millis() - rqStartMillis) > quantity + 2) {
+      else if ((millis() - rqStartMillis) > (unsigned long) (quantity + 2)) {
         rqCurrState = RQ_IDLE;
 	rqDone = true;
       }
